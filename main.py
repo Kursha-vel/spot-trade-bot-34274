@@ -1,5 +1,5 @@
 import os
-from python_binance import Client
+from binance.client import Client
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
