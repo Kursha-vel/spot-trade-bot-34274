@@ -1,4 +1,5 @@
-python-telegram-bot[job-queue]==20.3
+python-telegram-bot==20.3
+pandas==1.5.3
+ta==0.10.2
 requests==2.31.0
-pandas==2.0.3
-ta==0.11.0
+numpy==1.23.5
