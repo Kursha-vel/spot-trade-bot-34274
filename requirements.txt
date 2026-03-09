@@ -2,5 +2,4 @@ python-binance
 python-telegram-bot==20.3
 pandas
 ta
-json
 asyncio
