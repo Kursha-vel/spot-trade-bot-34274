@@ -1,0 +1,5 @@
+build:
+  pythonVersion: "3.11.0"
+plan: free
+type: worker
+startCommand: python main.py
