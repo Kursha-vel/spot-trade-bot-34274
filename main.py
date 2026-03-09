@@ -7,7 +7,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 
 # ──────────────────────────────────────────────────────────────────
 #  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -288,7 +288,12 @@ async def auto_scan_job(context) -> None:
 # ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .job_queue(JobQueue())
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("stop",    stop))
