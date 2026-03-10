@@ -1,316 +1,172 @@
-import os
-import json
-import asyncio
 import requests
-import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import MACD
-from ta.volatility import BollingerBands
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+import time
+import threading
+from flask import Flask, request
 
-# ──────────────────────────────────────────────────────────────────
-#  ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ──────────────────────────────────────────────────────────────────
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = "8686664882:AAHRg3lQpcoWwEeCkAVrAB3YIF2-fskOqyc"
+CHAT_ID = "750202787"
 
-# ──────────────────────────────────────────────────────────────────
-#  BINANCE REST API — без python-binance, только requests
-# ──────────────────────────────────────────────────────────────────
-BINANCE_URL = "https://api.binance.com"
+BINANCE = "https://api.binance.com/api/v3/ticker/24hr"
 
+app = Flask(__name__)
 
-def get_all_symbols() -> list:
-    """Возвращает список всех активных USDT-пар."""
-    r = requests.get(f"{BINANCE_URL}/api/v3/exchangeInfo", timeout=30)
-    r.raise_for_status()
-    return [
-        s["symbol"]
-        for s in r.json()["symbols"]
-        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
-    ]
+scanner_running = False
+history = []
+active_signals = []
 
+# -------- TELEGRAM --------
 
-def get_klines(symbol: str, interval: str = "1h", limit: int = 100) -> list:
-    """Возвращает свечи для указанного символа."""
-    r = requests.get(
-        f"{BINANCE_URL}/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+def send(text):
 
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-def get_ticker(symbol: str) -> dict:
-    """Возвращает 24-часовую статистику по символу."""
-    r = requests.get(
-        f"{BINANCE_URL}/api/v3/ticker/24hr",
-        params={"symbol": symbol},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
 
+    requests.post(url, data=data)
 
-# ──────────────────────────────────────────────────────────────────
-#  ЛОГИКА СКАНЕРА
-# ──────────────────────────────────────────────────────────────────
+# -------- COMMANDS --------
 
-def build_dataframe(klines: list) -> pd.DataFrame:
-    """Строит DataFrame из сырых свечей Binance."""
-    columns = [
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore",
-    ]
-    df = pd.DataFrame(klines, columns=columns)
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col])
-    return df
+def handle_command(cmd):
 
+    global scanner_running
 
-def check_signal(symbol: str) -> dict:
-    """
-    Проверяет одну монету на сигнал покупки.
-    Условия:
-      - RSI < 40
-      - MACD-гистограмма > 0  (пересечение вверх)
-      - Объём последней свечи > 2× средний объём
-      - Цена выше EMA20
-      - Цена отскочила от нижней полосы Боллинджера
-    Возвращает dict с сигналом или None.
-    """
-    try:
-        klines = get_klines(symbol, interval="1h", limit=100)
-        if len(klines) < 30:
-            return None
+    if cmd == "/start":
 
-        df = build_dataframe(klines)
+        send(
+"""🤖 Binance SPOT Trading Bot
 
-        # Технические индикаторы
-        rsi_val   = RSIIndicator(df["close"]).rsi().iloc[-1]
-        macd_diff = MACD(df["close"]).macd_diff().iloc[-1]
-        bb_low    = BollingerBands(df["close"]).bollinger_lband().iloc[-1]
-        ema20     = df["close"].ewm(span=20, adjust=False).mean().iloc[-1]
+Команды:
+/scan — запустить сканирование
+/stop — остановить сканирование
+/status — статус бота
+/history — история сигналов
+/active — активные сигналы
+/ping — проверка бота"""
+)
 
-        last_close  = df["close"].iloc[-1]
-        last_low    = df["low"].iloc[-1]
-        last_volume = df["volume"].iloc[-1]
-        avg_volume  = df["volume"].mean()
+    elif cmd == "/scan":
 
-        if (
-            rsi_val < 40
-            and macd_diff > 0
-            and last_volume > avg_volume * 2
-            and last_close > ema20
-            and last_low > bb_low
-        ):
-            ticker = get_ticker(symbol)
-            return {
-                "symbol":     symbol,
-                "price":      last_close,
-                "volume_24h": float(ticker.get("quoteVolume", 0)),
-                "change_24h": float(ticker.get("priceChangePercent", 0)),
-                "stop_loss":  round(last_close * 0.95, 8),
-                "target":     round(last_close * 1.15, 8),
-                "reason": (
-                    "RSI < 40, MACD пересечение вверх, "
-                    "объём > 2×среднего, цена выше EMA20, "
-                    "отскок от нижней полосы Боллинджера"
-                ),
-            }
-    except Exception:
-        pass  # Пропускаем монеты с ошибками (делистинг, нет данных и т.д.)
+        scanner_running = True
+        send("🔍 Сканирование рынка запущено")
 
-    return None
+    elif cmd == "/stop":
 
+        scanner_running = False
+        send("⛔ Сканирование остановлено")
 
-def run_scan() -> list:
-    """
-    Синхронный полный скан всех USDT-пар.
-    Вызывается через run_in_executor чтобы не блокировать бота.
-    Возвращает список найденных сигналов.
-    """
-    symbols = get_all_symbols()
-    signals = []
-    for symbol in symbols:
-        signal = check_signal(symbol)
-        if signal:
-            signals.append(signal)
-            # Сохраняем каждый сигнал в файл
-            with open("signals.json", "a", encoding="utf-8") as f:
-                json.dump(signal, f, ensure_ascii=False)
-                f.write("\n")
-    return signals
+    elif cmd == "/status":
 
+        status = "ON" if scanner_running else "OFF"
 
-# ──────────────────────────────────────────────────────────────────
-#  TELEGRAM HANDLERS
-# ──────────────────────────────────────────────────────────────────
+        send(f"📊 Scanner status: {status}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветственное сообщение."""
-    await update.message.reply_text(
-        "📊 *Бот для спотовой торговли на Binance*\n\n"
-        "Сканирует все USDT-пары и ищет сигналы покупки.\n\n"
-        "*Команды:*\n"
-        "/scan — запустить сканер прямо сейчас\n"
-        "/status — последние 5 сигналов\n"
-        "/history — последние 10 сигналов\n"
-        "/stop — остановить автосканер",
-        parse_mode="Markdown",
-    )
+    elif cmd == "/history":
 
+        if not history:
+            send("История сигналов пустая")
+        else:
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Останавливает фоновый автосканер."""
-    jobs = context.job_queue.get_jobs_by_name("auto_scan")
-    for job in jobs:
-        job.schedule_removal()
-    count = len(jobs)
-    if count:
-        await update.message.reply_text(f"🛑 Автосканер остановлен.")
-    else:
-        await update.message.reply_text("ℹ️ Автосканер не был запущен.")
+            msg = "📈 Последние сигналы\n\n"
 
+            for h in history[-5:]:
+                msg += h + "\n"
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает последние 5 сигналов."""
-    try:
-        with open("signals.json", "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        if not lines:
-            await update.message.reply_text("ℹ️ Сигналов ещё не было.")
-            return
-        recent = [json.loads(l) for l in lines[-5:]]
-        text = "📋 *Последние сигналы:*\n\n"
-        for s in recent:
-            text += (
-                f"🟢 *{s['symbol']}* — `{s['price']}`\n"
-                f"   Стоп: `{s['stop_loss']}` | Цель: `{s['target']}`\n\n"
-            )
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except FileNotFoundError:
-        await update.message.reply_text("ℹ️ Сигналов ещё не было.")
+            send(msg)
 
+    elif cmd == "/active":
 
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает последние 10 сигналов."""
-    try:
-        with open("signals.json", "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        if not lines:
-            await update.message.reply_text("ℹ️ История пуста.")
-            return
-        recent = [json.loads(l) for l in lines[-10:]]
-        text = "📜 *История сигналов (последние 10):*\n\n"
-        for s in recent:
-            text += (
-                f"• *{s['symbol']}* — вход: `{s['price']}`\n"
-                f"  Стоп: `{s['stop_loss']}` | Цель: `{s['target']}`\n"
-            )
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except FileNotFoundError:
-        await update.message.reply_text("ℹ️ История пуста.")
+        if not active_signals:
+            send("Активных сигналов нет")
+        else:
 
+            msg = "🔥 Активные сигналы\n\n"
 
-async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запускает сканер вручную по команде /scan."""
-    await update.message.reply_text(
-        "🔍 Запускаю сканер всех USDT-пар... Это займёт 1–3 минуты."
-    )
-    loop = asyncio.get_event_loop()
-    try:
-        # run_in_executor — синхронный скан не блокирует event loop бота
-        signals = await loop.run_in_executor(None, run_scan)
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка сканера:\n{exc}")
-        return
+            for s in active_signals:
+                msg += s + "\n"
 
-    if not signals:
-        await update.message.reply_text("😶 Сигналов не найдено.")
-        return
+            send(msg)
 
-    for s in signals:
-        await update.message.reply_text(
-            f"🟢 *СИГНАЛ ПОКУПКИ (СПОТ)*\n\n"
-            f"Монета: `{s['symbol']}`\n"
-            f"Цена входа: `{s['price']}`\n"
-            f"Стоп-лосс: `{s['stop_loss']}` (−5%)\n"
-            f"Цель: `{s['target']}` (+15%)\n"
-            f"Объём 24ч: `{s['volume_24h']:,.0f} USDT`\n"
-            f"Изменение 24ч: `{s['change_24h']}%`\n\n"
-            f"📌 *Причина:* {s['reason']}",
-            parse_mode="Markdown",
-        )
+    elif cmd == "/ping":
 
+        send("🏓 Bot alive")
 
-# ──────────────────────────────────────────────────────────────────
-#  АВТОСКАНИРОВАНИЕ КАЖДЫЕ 15 МИНУТ (JobQueue)
-# ──────────────────────────────────────────────────────────────────
+# -------- MARKET SCANNER --------
 
-async def auto_scan_job(context) -> None:
-    """
-    Фоновая задача — каждые 15 минут.
-    Результаты шлёт в чат если задана переменная CHAT_ID.
-    """
-    chat_id = os.environ.get("CHAT_ID")
-    if not chat_id:
-        return
+def scan_market():
 
-    loop = asyncio.get_event_loop()
-    try:
-        signals = await loop.run_in_executor(None, run_scan)
-    except Exception as exc:
-        await context.bot.send_message(
-            chat_id=chat_id, text=f"❌ Ошибка автоскана:\n{exc}"
-        )
-        return
+    global active_signals
 
-    for s in signals:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🟢 *СИГНАЛ ПОКУПКИ (СПОТ)*\n\n"
-                f"Монета: `{s['symbol']}`\n"
-                f"Цена входа: `{s['price']}`\n"
-                f"Стоп-лосс: `{s['stop_loss']}` (−5%)\n"
-                f"Цель: `{s['target']}` (+15%)\n\n"
-                f"📌 {s['reason']}"
-            ),
-            parse_mode="Markdown",
-        )
+    while True:
 
+        if scanner_running:
 
-# ──────────────────────────────────────────────────────────────────
-#  ТОЧКА ВХОДА
-# ──────────────────────────────────────────────────────────────────
+            try:
 
-def main() -> None:
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .job_queue(JobQueue())
-        .build()
-    )
+                data = requests.get(BINANCE).json()
 
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("stop",    stop))
-    app.add_handler(CommandHandler("status",  status))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("scan",    scan))
+                signals = []
 
-    # Автосканирование каждые 15 минут через встроенный JobQueue
-    app.job_queue.run_repeating(
-        auto_scan_job,
-        interval=15 * 60,   # каждые 15 минут
-        first=60,           # первый запуск через 60 секунд после старта
-        name="auto_scan",
-    )
+                for coin in data:
 
-    app.run_polling(drop_pending_updates=True)
+                    symbol = coin["symbol"]
 
+                    if not symbol.endswith("USDT"):
+                        continue
+
+                    volume = float(coin["quoteVolume"])
+                    change = float(coin["priceChangePercent"])
+
+                    if volume > 5000000 and change > 4:
+
+                        signals.append((symbol, change))
+
+                signals = sorted(signals, key=lambda x: x[1], reverse=True)[:2]
+
+                for s in signals:
+
+                    text = f"🔥 BUY SIGNAL\n\n{s[0]} +{round(s[1],2)}%"
+
+                    if s[0] not in active_signals:
+
+                        active_signals.append(s[0])
+                        history.append(s[0])
+
+                        send(text)
+
+                time.sleep(900)
+
+            except:
+
+                time.sleep(60)
+
+        else:
+
+            time.sleep(10)
+
+# -------- TELEGRAM WEBHOOK --------
+
+@app.route("/", methods=["POST"])
+def webhook():
+
+    data = request.json
+
+    if "message" in data:
+
+        text = data["message"].get("text")
+
+        if text and text.startswith("/"):
+
+            handle_command(text)
+
+    return "ok"
+
+# -------- START --------
+
+threading.Thread(target=scan_market).start()
 
 if __name__ == "__main__":
-    main()
+
+    app.run(host="0.0.0.0", port=10000)
